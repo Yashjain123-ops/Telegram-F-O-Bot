@@ -28,12 +28,37 @@ HUMAN-AI SYMBIOSIS:
 
 import pandas as pd
 import numpy as np
+import asyncio
 import logging
+from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timezone
 import config
 from chart_generator import generate_signal_chart
+from project_alpha.scanner.detectors import (
+    calculate_institutional_rr as detector_calculate_institutional_rr,
+    detect_opening_range,
+    detect_trend_day,
+    detect_vwap_pullback,
+    is_fakeout_candle as detector_is_fakeout_candle,
+    DetectorInput,
+    detect_volume_anomaly,
+    detect_oi_buildup,
+    detect_futures_basis,
+    detect_sector_participation,
+)
+from project_alpha.domain.models import SignalStage, Signal
+from project_alpha.scanner.scoring import InstitutionalScoringEngine
+from project_alpha.scanner.lifecycle import LifecycleEngine
+from project_alpha.tracking.signal_store import SignalRecord, SignalStore
+from project_alpha.tracking.validation import ValidationEngine
+from project_alpha.tracking.cooldown import CooldownTracker
+from project_alpha.paper_trading.engine import PaperTradingEngine
+from project_alpha.reliability.persistence import StatePersistenceEngine
+from project_alpha.reliability.recovery import TelegramRecoveryEngine, BrokerRecoveryEngine
+from project_alpha.reliability.monitoring import OperationalAlerting, HealthMonitoringEngine
+from project_alpha.reliability.deployment import DeploymentManager
 
-log = logging.getLogger("Strategy")
+log = logging.getLogger("MomentumScanner")
 
 
 class MomentumScanner:
@@ -43,50 +68,190 @@ class MomentumScanner:
         self.market_context = market_context   # MarketContext from data_fetcher.py
 
         # ── Live memory bank ─────────────────────────────────────────────────
+        self.candle_columns = ["timestamp", "open", "high", "low", "close", "volume"]
         self.live_data: dict[str, pd.DataFrame] = {
-            symbol: pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+            symbol: pd.DataFrame(columns=self.candle_columns)
             for symbol in config.UNIVERSE
         }
         self.live_data["NIFTY_50"] = pd.DataFrame(
-            columns=["open", "high", "low", "close", "volume"]
+            columns=self.candle_columns
         )
         for sector in config.SECTOR_GROUPS:
             self.live_data[sector] = pd.DataFrame(
-                columns=["open", "high", "low", "close", "volume"]
+                columns=self.candle_columns
             )
 
         # ── Signal deduplication ─────────────────────────────────────────────
-        self.last_signal: dict[str, dict] = {}
+        # Phase 6: Startup Recovery & Persistence
+        self.persistence = StatePersistenceEngine()
+        recovered_state = self.persistence.load_state()
+        
+        if recovered_state:
+            log.info("Booting from recovered State Snapshot.")
+            self.signal_store = recovered_state.get("signal_store", SignalStore())
+            self.validation_engine = recovered_state.get("validation_engine", ValidationEngine())
+            self.paper_trading = recovered_state.get("paper_trading", PaperTradingEngine(starting_capital=1_000_000.0))
+        else:
+            log.info("Booting fresh state.")
+            self.signal_store = SignalStore()
+            self.validation_engine = ValidationEngine()
+            self.paper_trading = PaperTradingEngine(starting_capital=1_000_000.0)
+
+        self.scoring_engine = InstitutionalScoringEngine()
+        self.lifecycle_engine = LifecycleEngine()
+        self.cooldowns = CooldownTracker(cooldown_seconds=300)
+
+        # Phase 6: Telegram Recovery Engine
+        self._raw_notifier = notifier
+        self.telegram_recovery = TelegramRecoveryEngine(
+            send_callback=self._send_telegram_alert, 
+            max_retries=5
+        )
+        
+        # Phase 6: Broker Recovery Engine (Mock callbacks for F&O Live Integration)
+        self.broker_recovery = BrokerRecoveryEngine(
+            reconnect_callback=self._mock_broker_reconnect,
+            validate_callback=self._mock_broker_validate
+        )
+        
+        # Phase 6: Operational Alerting & Health Monitor
+        self.op_alerting = OperationalAlerting(alert_callback=self._send_telegram_alert)
+        self.health_monitor = HealthMonitoringEngine(
+            strategy_instance=self,
+            alert_engine=self.op_alerting,
+            broker_recovery=self.broker_recovery
+        )
+        
+        # Phase 6: Deployment Hardening
+        self.deployment_manager = DeploymentManager(self, self.persistence)
+        
+    async def _mock_broker_validate(self) -> bool:
+        """Mock broker socket validation."""
+        return True
+        
+    async def _mock_broker_reconnect(self) -> bool:
+        """Mock broker reconnect logic."""
+        return True
+        
+    async def _send_telegram_alert(self, msg: str, **kwargs) -> bool:
+        """Wrapper for Telegram API to support recovery queues."""
+        if self._raw_notifier:
+            try:
+                photo = kwargs.get("photo")
+                if asyncio.iscoroutinefunction(self._raw_notifier.send_photo) if hasattr(self._raw_notifier, 'send_photo') else False:
+                    if photo:
+                        await self._raw_notifier.send_photo(caption=msg, image_bytes=photo)
+                    else:
+                        await self._raw_notifier.send(msg)
+                else:
+                    if photo and hasattr(self._raw_notifier, 'send_photo'):
+                        self._raw_notifier.send_photo(caption=msg, image_bytes=photo)
+                    elif hasattr(self._raw_notifier, 'send'):
+                        self._raw_notifier.send(msg)
+                    else:
+                        if asyncio.iscoroutinefunction(self._raw_notifier):
+                            await self._raw_notifier(msg)
+                        else:
+                            self._raw_notifier(msg)
+                return True
+            except Exception:
+                return False
+        return True
+
+    async def start_background_tasks(self):
+        """Phase 6 background services."""
+        await self.telegram_recovery.start()
+        await self.broker_recovery.start_monitoring()
+        await self.health_monitor.start()
 
     # ══════════════════════════════════════════════════════════════════════════
     # DATA INGESTION
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def on_candle(self, symbol: str, candle_data: dict):
-        """
-        Called by broker.py on every committed 1-minute candle.
-        Appends to memory and triggers immediate evaluation.
-        """
+    async def on_candle(self, symbol: str, candle_dict: dict[str, Any]):
         try:
-            new_row = pd.DataFrame([{
-                "open":   candle_data["open"],
-                "high":   candle_data["high"],
-                "low":    candle_data["low"],
-                "close":  candle_data["close"],
-                "volume": candle_data.get("volume", 1),
-            }])
-            self.live_data[symbol] = pd.concat(
-                [self.live_data[symbol], new_row], ignore_index=True
-            ).tail(50)
+            candle_df = pd.DataFrame([candle_dict])
+            candle_df.set_index("timestamp", inplace=True)
+            self._update_live_data(symbol, candle_df)
+            
+            # Check Kill Switch
+            if self.validation_engine.evaluate_kill_switch():
+                log.warning("💀 KILL SWITCH ACTIVE. 5 consecutive losses. Suspending trading.")
+                return
 
-            # Only evaluate F&O stocks, not sector indices or NIFTY_50
-            if symbol in config.UNIVERSE:
+            df = self.live_data.get(symbol, pd.DataFrame())
+            if not df.empty:
+                current_candle = df.iloc[-1]
+                # 2. MFE/MAE UPDATES: Update Excursion metrics for all ACTIVE tracked trades
+                for record in self.signal_store.get_all_active():
+                    if record.symbol == symbol:
+                        self.validation_engine.update_signal(record, current_candle)
+                        
+                # 3. PAPER TRADING TICK UPDATE:
+                self.paper_trading.update_market_data(symbol, current_candle)
+
+            if len(df) >= config.MIN_CANDLES_REQUIRED:
                 await self._evaluate_symbol(symbol)
-
-        except KeyError:
-            pass
         except Exception as e:
-            log.debug(f"on_candle error [{symbol}]: {e}")
+            log.error(f"Error evaluating candle for {symbol}: {e}", exc_info=True)
+
+    def _update_live_data(self, symbol: str, candle_df: pd.DataFrame):
+        df = self.live_data.get(symbol, pd.DataFrame(columns=self.candle_columns))
+        self.live_data[symbol] = pd.concat([df, candle_df]).tail(50)
+        self._update_sector_context(symbol)
+
+    def _is_scanner_active(self, candle_ts=None) -> bool:
+        ts = candle_ts
+        if ts is None or pd.isna(ts):
+            ts = datetime.now(config.TIMEZONE)
+        if ts.tzinfo is None:
+            ts = config.TIMEZONE.localize(ts)
+        if ts.weekday() >= 5:
+            return False
+        return config.SCANNER_START <= ts.time() <= config.MARKET_CLOSE
+
+    def _update_sector_context(self, symbol: str):
+        sector = config.get_sector_for_symbol(symbol)
+        members = config.SECTOR_GROUPS.get(sector, [])
+        if not members:
+            return
+
+        source_df = self.live_data.get(symbol)
+        if source_df is None or source_df.empty:
+            return
+
+        current_ts = source_df.iloc[-1].get("timestamp")
+        if current_ts is None or pd.isna(current_ts):
+            return
+
+        rows = []
+        for member in members:
+            member_df = self.live_data.get(member)
+            if member_df is None or member_df.empty:
+                continue
+            latest = member_df.iloc[-1]
+            if latest.get("timestamp") == current_ts:
+                rows.append(latest)
+
+        min_members = min(5, max(3, len(members) // 4))
+        if len(rows) < min_members:
+            return
+
+        sector_row = pd.DataFrame([{
+            "timestamp": current_ts,
+            "open": sum(float(row["open"]) for row in rows),
+            "high": sum(float(row["high"]) for row in rows),
+            "low": sum(float(row["low"]) for row in rows),
+            "close": sum(float(row["close"]) for row in rows),
+            "volume": sum(int(row["volume"]) for row in rows),
+        }])
+        sector_df = self.live_data.get(sector, pd.DataFrame(columns=self.candle_columns))
+        if not sector_df.empty and sector_df.iloc[-1].get("timestamp") == current_ts:
+            sector_df = sector_df.iloc[:-1]
+        self.live_data[sector] = (
+            sector_row if sector_df.empty
+            else pd.concat([sector_df, sector_row], ignore_index=True)
+        ).tail(50)
 
     # ══════════════════════════════════════════════════════════════════════════
     # INDICATOR CALCULATIONS
@@ -110,16 +275,7 @@ class MomentumScanner:
         return df
 
     def _is_fakeout_candle(self, candle: pd.Series, direction: str) -> bool:
-        total_range = candle["high"] - candle["low"]
-        if total_range <= 0:
-            return True
-        if direction == "BULLISH":
-            upper_wick = candle["high"] - max(candle["open"], candle["close"])
-            return (upper_wick / total_range) > config.MAX_WICK_PERCENT
-        elif direction == "BEARISH":
-            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-            return (lower_wick / total_range) > config.MAX_WICK_PERCENT
-        return False
+        return detector_is_fakeout_candle(candle, direction)
 
     # ══════════════════════════════════════════════════════════════════════════
     # ① NIFTY 50 REGIME FILTER  (new)
@@ -152,152 +308,34 @@ class MomentumScanner:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _is_trend_day_candidate(self, df: pd.DataFrame, sector_df: pd.DataFrame) -> dict:
-        if len(df) < config.MIN_CANDLES_REQUIRED:
-            return {"qualified": False, "reason": "Insufficient candles", "vol_ratio": 0.0}
-
-        today_range     = df["high"].max() - df["low"].min()
-        atr             = df["atr"].iloc[-1] if "atr" in df.columns else 0
-        ltp             = df["close"].iloc[-1]
-        atr_price_ratio = (atr / ltp) if ltp > 0 else 0
-
-        if atr_price_ratio < config.MIN_ATR_PRICE_RATIO:
-            return {"qualified": False, "reason": "Stock too illiquid/flat", "vol_ratio": 0.0}
-
-        range_expansion = (today_range / atr) if atr > 0 else 0
-        lookback        = min(config.AVG_VOLUME_LOOKBACK, len(df) - 1)
-        avg_vol         = df["volume"].iloc[-lookback - 1:-1].mean() if lookback > 0 else 1
-        cur_vol         = df["volume"].iloc[-1]
-        vol_ratio       = (cur_vol / avg_vol) if avg_vol > 0 else 0
-        institutional_vol = vol_ratio >= config.INSTITUTIONAL_VOL_SPIKE
-
-        sector_momentum  = False
-        sector_vol_ratio = 0.0
-        if len(sector_df) >= 5:
-            s_lookback       = min(config.AVG_VOLUME_LOOKBACK, len(sector_df) - 1)
-            s_avg_vol        = sector_df["volume"].iloc[-s_lookback - 1:-1].mean()
-            s_cur_vol        = sector_df["volume"].iloc[-1]
-            sector_vol_ratio = (s_cur_vol / s_avg_vol) if s_avg_vol > 0 else 0
-            sector_momentum  = sector_vol_ratio >= config.SECTOR_VOL_SPIKE
-
-        qualified = range_expansion >= 1.2 and institutional_vol and sector_momentum
-
-        return {
-            "qualified":        qualified,
-            "vol_ratio":        round(vol_ratio, 2),
-            "range_expansion":  round(range_expansion, 2),
-            "sector_tailwind":  sector_momentum,
-            "sector_vol_ratio": round(sector_vol_ratio, 2),
-            "atr":              round(atr, 4),
-            "ltp":              round(ltp, 2),
-        }
+        return detect_trend_day(df, sector_df).to_legacy_dict()
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2 — VWAP PULLBACK SNIPER DETECTOR
     # ══════════════════════════════════════════════════════════════════════════
 
     def _detect_vwap_pullback(self, df: pd.DataFrame, direction: str) -> dict:
-        if len(df) < 8:
-            return {"setup_confirmed": False, "confidence_add": 0.0}
-
-        ltp  = df["close"].iloc[-1]
-        vwap = df["vwap"].iloc[-1]
-        atr  = df["atr"].iloc[-1]
-
-        if vwap <= 0 or atr <= 0:
-            return {"setup_confirmed": False, "confidence_add": 0.0}
-
-        vwap_proximity_pct = abs(ltp - vwap) / vwap
-        near_vwap          = vwap_proximity_pct <= config.VWAP_PROXIMITY_BAND
-        breakout_vol       = df["volume"].iloc[-8:-3].mean()
-        pullback_vol       = df["volume"].iloc[-3:].mean()
-        volume_dried       = (pullback_vol < breakout_vol * config.PULLBACK_VOL_RATIO) if breakout_vol > 0 else False
-        last               = df.iloc[-1]
-        candle_range       = last["high"] - last["low"]
-        close_location     = (last["close"] - last["low"]) / candle_range if candle_range > 0 else 0.5
-
-        if direction == "BULLISH":
-            rejection_confirmed = close_location >= config.REJECTION_CLOSE_LOC
-            setup_confirmed     = near_vwap and volume_dried and rejection_confirmed and ltp > vwap
-            entry_zone          = round(vwap * 1.001, 2)
-            invalidation        = round(vwap * 0.997, 2)
-        else:
-            rejection_confirmed = close_location <= (1 - config.REJECTION_CLOSE_LOC)
-            setup_confirmed     = near_vwap and volume_dried and rejection_confirmed and ltp < vwap
-            entry_zone          = round(vwap * 0.999, 2)
-            invalidation        = round(vwap * 1.003, 2)
-
-        return {
-            "setup_confirmed":    setup_confirmed,
-            "vwap":               round(vwap, 2),
-            "vwap_proximity_pct": round(vwap_proximity_pct * 100, 3),
-            "volume_dried_up":    volume_dried,
-            "rejection_candle":   rejection_confirmed,
-            "entry_zone":         entry_zone,
-            "invalidation":       invalidation,
-            "confidence_add":     0.20 if setup_confirmed else 0.0,
-        }
+        payload = detect_vwap_pullback(df, direction).to_legacy_dict()
+        payload.setdefault("setup_confirmed", False)
+        payload.setdefault("confidence_add", 0.0)
+        return payload
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 3 — INSTITUTIONAL R:R GATE
     # ══════════════════════════════════════════════════════════════════════════
 
     def _calculate_institutional_rr(self, entry: float, sl: float, vol_ratio: float) -> dict:
-        risk = abs(entry - sl)
-        if risk <= 0:
-            return {"viable": False, "rr_ratio": 0.0, "target": entry, "risk": 0.0, "tier": 0}
-
-        # THREE-TIER TARGET SYSTEM based on institutional volume strength
-        #
-        #  TIER 3 — Campaign day (8x+ vol) → 1:8 target
-        #           Rare. Budget day, RBI policy, big earnings.
-        #           Stock typically moves 6%–10% intraday.
-        #
-        #  TIER 2 — Strong institutional day (5x–7.9x vol) → 1:6 target
-        #           TCS June 2 type day. 4%–6% move.
-        #
-        #  TIER 1 — Normal institutional day (3x–4.9x vol) → 1:4 target
-        #           Solid trend day. 2%–4% move.
-
-        if vol_ratio >= config.CAMPAIGN_VOL_SPIKE:
-            rr_mult = config.CAMPAIGN_DAY_RR_MULT    # 1:8
-            tier    = 3
-            tier_label = "🔥 CAMPAIGN DAY"
-        elif vol_ratio >= config.SNIPER_VOL_SPIKE:
-            rr_mult = config.TREND_DAY_RR_MULT       # 1:6
-            tier    = 2
-            tier_label = "⚡ STRONG DAY"
-        else:
-            rr_mult = config.STANDARD_RR_MULT        # 1:4
-            tier    = 1
-            tier_label = "📈 TREND DAY"
-
-        target    = entry + (risk * rr_mult) if entry > sl else entry - (risk * rr_mult)
-        actual_rr = abs(target - entry) / risk
-
-        return {
-            "viable":      actual_rr >= config.MIN_RR_RATIO,
-            "rr_ratio":    round(actual_rr, 2),
-            "target":      round(target, 2),
-            "risk":        round(risk, 2),
-            "tier":        tier,
-            "tier_label":  tier_label,
-        }
+        return detector_calculate_institutional_rr(entry, sl, vol_ratio).to_legacy_dict()
 
     # ══════════════════════════════════════════════════════════════════════════
     # SIGNAL DEDUPLICATION
     # ══════════════════════════════════════════════════════════════════════════
 
     def _is_on_cooldown(self, symbol: str, stage: int) -> bool:
-        last = self.last_signal.get(symbol)
-        if not last:
-            return False
-        elapsed = (datetime.now(timezone.utc) - last["ts"]).total_seconds()
-        if last["stage"] < stage:
-            return False
-        return elapsed < config.SIGNAL_COOLDOWN_SECONDS
+        return self.cooldowns.is_on_cooldown(symbol, stage)
 
     def _record_signal(self, symbol: str, stage: int):
-        self.last_signal[symbol] = {"stage": stage, "ts": datetime.now(timezone.utc)}
+        self.cooldowns.record(symbol, stage, datetime.now(timezone.utc))
 
     # ══════════════════════════════════════════════════════════════════════════
     # MAIN EVALUATION GATEWAY
@@ -308,11 +346,7 @@ class MomentumScanner:
         Full evaluation pipeline with all 5 intelligence layers.
         Triggered on every candle close via on_candle().
         """
-        try:
-            from bot import FLAT_SECTOR_MAP
-            assigned_sector = FLAT_SECTOR_MAP.get(symbol, "NIFTY_50")
-        except ImportError:
-            assigned_sector = "NIFTY_50"
+        assigned_sector = config.get_sector_for_symbol(symbol)
 
         stock_df  = self.live_data.get(symbol, pd.DataFrame())
         sector_df = self.live_data.get(assigned_sector, pd.DataFrame())
@@ -324,14 +358,13 @@ class MomentumScanner:
         df = self._calculate_vwap(df)
 
         current_candle = df.iloc[-1]
-        ltp            = current_candle["close"]
-        vwap           = current_candle["vwap"]
-        opening_high   = df["high"].iloc[:3].max()
-        opening_low    = df["low"].iloc[:3].min()
+        opening_range = detect_opening_range(df).to_legacy_dict()
+        ltp           = opening_range["ltp"]
+        vwap          = opening_range["vwap"]
+        bullish       = opening_range["bullish"]
+        bearish       = opening_range["bearish"]
 
-        bullish   = ltp > opening_high and ltp > vwap
-        bearish   = ltp < opening_low  and ltp < vwap
-        if not bullish and not bearish:
+        if not opening_range["qualified"]:
             return
 
         direction = "BULLISH" if bullish else "BEARISH"
@@ -355,120 +388,107 @@ class MomentumScanner:
             log.debug(f"[{symbol}] Skipping — earnings/corporate action today")
             return   # Too unpredictable — sit out
 
-        # ══ PHASE 1: TREND DAY QUALITY ════════════════════════════════════════
-        phase1 = self._is_trend_day_candidate(df, sector_df)
-        if not phase1["qualified"]:
-            return
+        # ══ PHASE 1 & 2: BRAIN IMPLANT (INSTITUTIONAL PIPELINE) ═════════════
+        detector_input = DetectorInput(
+            symbol=symbol,
+            candles=df,
+            market_context=self.market_context,
+            sector_candles=sector_df,
+            direction=direction
+        )
 
-        vol_ratio  = phase1["vol_ratio"]
-        confidence = 0.0
-        reasons    = []
+        vol_res = detect_volume_anomaly(detector_input)
+        oi_res = detect_oi_buildup(detector_input)
+        basis_res = detect_futures_basis(detector_input)
+        sector_res = detect_sector_participation(detector_input)
 
-        confidence += 0.30
-        reasons.append(f"ORB {'Breakout' if bullish else 'Breakdown'}")
+        results = [vol_res, oi_res, basis_res, sector_res]
+        score_breakdown = self.scoring_engine.calculate_global_score(results, detector_input)
+        new_stage = self.lifecycle_engine.evaluate_transition(score_breakdown, 0)
 
-        if vol_ratio >= config.SNIPER_VOL_SPIKE:
-            confidence += 0.25
-            reasons.append(f"Institutional Campaign ({vol_ratio}x vol 🏛️)")
-        elif vol_ratio >= config.INSTITUTIONAL_VOL_SPIKE:
-            confidence += 0.20
-            reasons.append(f"Institutional Accumulation ({vol_ratio}x vol)")
+        # Retrieve entry points via base logic fallback
+        phase2 = self._detect_vwap_pullback(df, direction)
+        vol_ratio = vol_res.data.get("rvol", 1.0) if vol_res.qualified else 1.0
 
-        if phase1["sector_tailwind"]:
-            confidence += 0.25
-            reasons.append(f"Sector Tailwind ({phase1['sector_vol_ratio']}x sector vol)")
-
-        # ══ INTELLIGENCE LAYER ②: FII FLOW ═══════════════════════════════════
-        if self.market_context:
-            fii_sentiment = self.market_context.fii_sentiment
-            if (direction == "BULLISH" and fii_sentiment == "BULLISH") or \
-               (direction == "BEARISH" and fii_sentiment == "BEARISH"):
-                confidence += config.FII_CONFIDENCE_BOOST
-                reasons.append(f"FII Aligned ₹{self.market_context.fii_net_crore:+.0f}cr ✅")
-            elif (direction == "BULLISH" and fii_sentiment == "BEARISH") or \
-                 (direction == "BEARISH" and fii_sentiment == "BULLISH"):
-                confidence -= config.FII_CONFIDENCE_BOOST
-                reasons.append(f"FII Contra ₹{self.market_context.fii_net_crore:+.0f}cr ⚠️")
-
-        # ══ INTELLIGENCE LAYER ④: PCR FILTER ═════════════════════════════════
-        if self.market_context:
-            pcr_sentiment = self.market_context.pcr_sentiment
-            if (direction == "BULLISH" and pcr_sentiment == "BULLISH") or \
-               (direction == "BEARISH" and pcr_sentiment == "BEARISH"):
-                confidence += config.PCR_CONFIDENCE_BOOST
-                reasons.append(f"PCR Confirms ({self.market_context.nifty_pcr:.2f}) ✅")
-
-        # ── Stage 1 WATCH alert ───────────────────────────────────────────────
-        if confidence >= config.CONFIDENCE_WATCH_THRESHOLD and not self._is_on_cooldown(symbol, 1):
-            atr = phase1["atr"]
-            sl  = (ltp - atr * config.ATR_MULTIPLIER_SL) if bullish else (ltp + atr * config.ATR_MULTIPLIER_SL)
-            rr  = self._calculate_institutional_rr(ltp, sl, vol_ratio)
-            self._record_signal(symbol, 1)
+        if new_stage == SignalStage.SUSPECTED:
+            if self._is_on_cooldown(symbol, int(SignalStage.SUSPECTED)): return
+            self._record_signal(symbol, int(SignalStage.SUSPECTED))
+            log.info(f"[{symbol}] SUSPECTED Anomaly (Score: {score_breakdown.total})")
+            
+        elif new_stage == SignalStage.CONFIRMED:
+            if self._is_on_cooldown(symbol, int(SignalStage.CONFIRMED)): return
+            self._record_signal(symbol, int(SignalStage.CONFIRMED))
+            atr = df.iloc[-1]["atr"]
+            sl = (ltp - atr * config.ATR_MULTIPLIER_SL) if bullish else (ltp + atr * config.ATR_MULTIPLIER_SL)
+            rr = self._calculate_institutional_rr(ltp, sl, vol_ratio)
             if self.notifier:
                 await self.notifier.send(
-                    self._format_watch_alert(symbol, assigned_sector, ltp, vwap, phase1, rr, reasons, direction, nifty_regime)
+                    self._format_watch_alert(symbol, assigned_sector, ltp, vwap, {"vol_ratio": round(vol_ratio,2), "range_expansion": 1.5, "sector_tailwind": sector_res.qualified}, rr, score_breakdown.reasons, direction, nifty_regime, score_breakdown)
                 )
-            return
 
-        # ══ PHASE 2: VWAP PULLBACK ════════════════════════════════════════════
-        phase2 = self._detect_vwap_pullback(df, direction)
-        if phase2["setup_confirmed"]:
-            confidence += phase2["confidence_add"]
-            reasons.append("VWAP Pullback + Rejection ✅")
-
-        # ── Stage 2 TRIGGER alert ─────────────────────────────────────────────
-        if confidence >= config.CONFIDENCE_TRIGGER_THRESHOLD and phase2["setup_confirmed"]:
-            if self._is_on_cooldown(symbol, 2):
-                return
-
-            entry = phase2["entry_zone"]
-            sl    = phase2["invalidation"]
-            rr    = self._calculate_institutional_rr(entry, sl, vol_ratio)
-
-            if not rr["viable"]:
-                return
-
-            self._record_signal(symbol, 2)
-
-            if self.notifier:
-                # ══ INTELLIGENCE LAYER ⑤: CHART IMAGE ════════════════════════
-                # Get news context for this symbol
-                news = []
-                if self.market_context:
-                    news = self.market_context.get_news_for(symbol)
-
-                # Format text alert
+        elif new_stage == SignalStage.PRIME_CANDIDATE:
+            if self._is_on_cooldown(symbol, int(SignalStage.PRIME_CANDIDATE)): return
+            self._record_signal(symbol, int(SignalStage.PRIME_CANDIDATE))
+            entry = phase2.get("entry_zone", ltp)
+            sl = phase2.get("invalidation", ltp * 0.99)
+            rr = self._calculate_institutional_rr(entry, sl, vol_ratio)
+            
+            # Phase 3 Tracking: Upsert to signal store
+            signal_id = f"{symbol}_{datetime.now(timezone.utc).strftime('%H%M%S')}"
+            sl_pct = abs(entry - sl) / entry * 100.0 if entry > 0 else 0
+            target_pct = abs(rr['target'] - entry) / entry * 100.0 if entry > 0 else 0
+            
+            
+            # Determine sector (mocking an extractor if market_context is generic)
+            sector = "UNKNOWN"
+            if "BANK" in symbol: sector = "BANKING"
+            elif "FIN" in symbol: sector = "FINANCE"
+            elif "IT" in symbol or symbol in ["TCS", "INFY", "WIPRO", "HCLTECH", "TECHM"]: sector = "IT"
+            elif symbol in ["RELIANCE", "ONGC", "BPCL", "IOC", "PETRONET"]: sector = "ENERGY"
+            elif symbol in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]: sector = "INDEX"
+            
+            record = SignalRecord(
+                signal_id=signal_id,
+                symbol=symbol,
+                stage=int(SignalStage.PRIME_CANDIDATE),
+                direction=direction,
+                created_at=datetime.now(timezone.utc),
+                entry_price=entry,
+                sl_price=sl,
+                target_price=rr['target'],
+                sl_pct=sl_pct,
+                target_pct=target_pct,
+                detector_reasons=score_breakdown.reasons,
+                institutional_score=score_breakdown.total,
+                market_regime=nifty_regime,
+                sector=sector
+            )
+            self.signal_store.upsert(record)
+            
+            # Phase 5: Hook into Paper Trading Simulation
+            self.paper_trading.process_signal(record)
+            
+            # Phase 6: Telegram Recovery Engine triggers safe transmit
+            if self._raw_notifier:
+                news = self.market_context.get_news_for(symbol) if self.market_context else []
                 alert_text = self._format_trigger_alert(
                     symbol, assigned_sector, entry, sl, rr,
-                    phase1, phase2, reasons, direction, nifty_regime, news
+                    {"vol_ratio": round(vol_ratio,2)}, phase2, score_breakdown.reasons, direction, nifty_regime, news, score_breakdown
                 )
-
-                # Generate chart image
-                chart_bytes = generate_signal_chart(
-                    symbol    = symbol,
-                    df        = df,
-                    entry     = entry,
-                    sl        = sl,
-                    target    = rr["target"],
-                    direction = direction,
-                    vwap_col  = "vwap",
-                )
-
-                if chart_bytes:
-                    # Send chart photo with alert as caption
-                    await self.notifier.send_photo(caption=alert_text, image_bytes=chart_bytes)
-                else:
-                    # Fallback to text-only if chart generation failed
-                    await self.notifier.send(alert_text)
+                chart_bytes = generate_signal_chart(symbol=symbol, df=df, entry=entry, sl=sl, target=rr["target"], direction=direction, vwap_col="vwap")
+                
+                # Using TelegramRecoveryEngine
+                asyncio.create_task(self.telegram_recovery.queue_alert(alert_text, photo=chart_bytes))
 
     # ══════════════════════════════════════════════════════════════════════════
     # ALERT FORMATTERS
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _format_watch_alert(self, symbol, sector, ltp, vwap, phase1, rr, reasons, direction, nifty_regime) -> str:
+    def _format_watch_alert(self, symbol, sector, ltp, vwap, phase1, rr, reasons, direction, nifty_regime, score_breakdown=None) -> str:
         emoji = "📈" if direction == "BULLISH" else "📉"
         arrow = "▲" if direction == "BULLISH" else "▼"
         ctx   = self.market_context
+        score_text = f"\n\n🏆 *Institutional Score:* {score_breakdown.total}/100 ({score_breakdown.category})" if score_breakdown else ""
         return (
             f"⚠️ *WARZONE FOUND — WATCH* {emoji}\n\n"
             f"*{symbol}* | {sector}\n"
@@ -481,7 +501,7 @@ class MomentumScanner:
             f"📊 *Market Intelligence:*\n"
             f"  Nifty Regime : *{nifty_regime}*\n"
             f"  FII Flow     : ₹{ctx.fii_net_crore:+.0f}cr ({ctx.fii_sentiment})\n"
-            f"  PCR          : {ctx.nifty_pcr:.2f} ({ctx.pcr_sentiment})\n\n"
+            f"  PCR          : {ctx.nifty_pcr:.2f} ({ctx.pcr_sentiment}){score_text}\n\n"
             f"Projected R:R: *1:{rr['rr_ratio']}*\n\n"
             f"📋 *Catalysts:*\n" +
             "\n".join(f"  • {r}" for r in reasons) +
@@ -490,18 +510,19 @@ class MomentumScanner:
         ) if ctx else (
             f"⚠️ *WARZONE FOUND — WATCH* {emoji}\n\n"
             f"*{symbol}* | {sector} | *{direction}* {arrow}\n"
-            f"LTP: ₹{ltp} | Vol: *{phase1['vol_ratio']}x* | R:R: *1:{rr['rr_ratio']}*\n"
+            f"LTP: ₹{ltp} | Vol: *{phase1['vol_ratio']}x* | R:R: *1:{rr['rr_ratio']}*{score_text}\n"
             f"{'─' * 30}\n" +
             "\n".join(f"  • {r}" for r in reasons) +
             f"\n\n🔍 *Wait for VWAP pullback.*"
         )
 
-    def _format_trigger_alert(self, symbol, sector, entry, sl, rr, phase1, phase2, reasons, direction, nifty_regime, news) -> str:
+    def _format_trigger_alert(self, symbol, sector, entry, sl, rr, phase1, phase2, reasons, direction, nifty_regime, news, score_breakdown=None) -> str:
         arrow      = "▲" if direction == "BULLISH" else "▼"
         risk_pct   = round((abs(entry - sl) / entry) * 100, 2)
         ctx        = self.market_context
         news_str   = news[0][:60] + "..." if news else "No major headlines"
         tier_label = rr.get("tier_label", "📈 TREND DAY")
+        score_text = f"\n🏆 *Institutional Score:* {score_breakdown.total}/100 ({score_breakdown.category})" if score_breakdown else ""
 
         base = (
             f"🎯 *SNIPER TRIGGER — ENTRY ZONE* {arrow}\n\n"
@@ -509,7 +530,7 @@ class MomentumScanner:
             f"{'─' * 30}\n"
             f"Direction : *{direction}*\n"
             f"Day Type  : *{tier_label}*\n"
-            f"Vol Ratio : *{phase1['vol_ratio']}x* 🏛️\n\n"
+            f"Vol Ratio : *{phase1['vol_ratio']}x* 🏛️{score_text}\n\n"
             f"💰 *TRADE PARAMETERS:*\n"
             f"  Entry Zone : ₹{entry}\n"
             f"  Stop-Loss  : ₹{sl}  ({risk_pct}% risk)\n"
@@ -527,9 +548,9 @@ class MomentumScanner:
             )
         base += (
             f"🔬 *Setup Quality:*\n"
-            f"  VWAP Proximity : {phase2['vwap_proximity_pct']}%\n"
-            f"  Volume Dry-up  : {'✅' if phase2['volume_dried_up'] else '❌'}\n"
-            f"  Rejection Wick : {'✅' if phase2['rejection_candle'] else '❌'}\n\n"
+            f"  VWAP Proximity : {phase2.get('vwap_proximity_pct', 0)}%\n"
+            f"  Volume Dry-up  : {'✅' if phase2.get('volume_dried_up') else '❌'}\n"
+            f"  Rejection Wick : {'✅' if phase2.get('rejection_candle') else '❌'}\n\n"
             f"📋 *Confirmed Factors:*\n" +
             "\n".join(f"  • {r}" for r in reasons) +
             f"\n\n⚡ *HUMAN CONFIRMATION REQUIRED*\n"

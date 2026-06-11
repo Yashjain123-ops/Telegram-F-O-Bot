@@ -18,7 +18,6 @@ Output: PNG image as bytes (in-memory, no temp files on disk)
 
 import io
 import logging
-import numpy as np
 import pandas as pd
 import mplfinance as mpf
 import matplotlib
@@ -65,15 +64,18 @@ def generate_signal_chart(
             log.warning(f"Not enough candles to generate chart for {symbol}")
             return None
 
-        # mplfinance requires DatetimeIndex with capital OHLCV columns
-        # We generate synthetic timestamps starting from 09:15 IST
-        from datetime import datetime, timedelta
-        import pytz
-        base_time = datetime.now(pytz.timezone("Asia/Kolkata")).replace(
-            hour=9, minute=15, second=0, microsecond=0
-        )
-        timestamps = [base_time + timedelta(minutes=i) for i in range(len(plot_df))]
-        plot_df.index = pd.DatetimeIndex(timestamps)
+        # mplfinance requires a DatetimeIndex. Prefer live candle timestamps;
+        # fall back to synthetic timestamps for legacy/offline fixtures.
+        if "timestamp" in plot_df.columns and plot_df["timestamp"].notna().any():
+            plot_df.index = pd.DatetimeIndex(plot_df["timestamp"])
+        else:
+            from datetime import datetime, timedelta
+            import pytz
+            base_time = datetime.now(pytz.timezone("Asia/Kolkata")).replace(
+                hour=9, minute=15, second=0, microsecond=0
+            )
+            timestamps = [base_time + timedelta(minutes=i) for i in range(len(plot_df))]
+            plot_df.index = pd.DatetimeIndex(timestamps)
 
         # Rename columns to mplfinance format (capital letters)
         plot_df = plot_df.rename(columns={

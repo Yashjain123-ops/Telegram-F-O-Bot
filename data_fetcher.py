@@ -114,6 +114,12 @@ class MarketContext:
 
         # ── Nifty Regime (computed from live candle data in strategy) ────────
         self.nifty_regime: str = "NEUTRAL"   # BULLISH / BEARISH / NEUTRAL
+        self.updated_at: datetime | None = None
+        self.source_status: dict[str, str] = {}
+
+    def mark_source(self, source: str, status: str):
+        self.source_status[source] = status
+        self.updated_at = datetime.now(config.TIMEZONE)
 
     def is_earnings_day(self, symbol: str) -> bool:
         return symbol.upper() in self.earnings_today
@@ -125,7 +131,8 @@ class MarketContext:
         return (
             f"FII: ₹{self.fii_net_crore:+.0f}cr ({self.fii_sentiment}) | "
             f"PCR: {self.nifty_pcr:.2f} ({self.pcr_sentiment}) | "
-            f"Earnings today: {len(self.earnings_today)} stocks"
+            f"Earnings today: {len(self.earnings_today)} stocks | "
+            f"Sources: {self.source_status}"
         )
 
 
@@ -175,6 +182,7 @@ class MarketDataFetcher:
             data = self.nse.get("/api/fiidiiTradeReact")
             if not data:
                 log.warning("FII/DII: No data returned from NSE (keeping neutral defaults)")
+                self.context.mark_source("fii_dii", "fallback_neutral")
                 return
 
             fii_net = 0.0
@@ -196,6 +204,7 @@ class MarketDataFetcher:
             self.context.fii_net_crore = round(fii_net, 2)
             self.context.dii_net_crore = round(dii_net, 2)
             self.context.fii_data_date = datetime.now(config.TIMEZONE).strftime("%d-%b-%Y")
+            self.context.mark_source("fii_dii", "ok")
 
             # Classify FII sentiment
             if fii_net >= config.FII_BULLISH_THRESHOLD:
@@ -209,6 +218,7 @@ class MarketDataFetcher:
 
         except Exception as e:
             log.warning(f"FII/DII fetch failed: {e}")
+            self.context.mark_source("fii_dii", "failed")
 
     # ── OPTIONS CHAIN (PCR + MAX PAIN) ────────────────────────────────────────
 
@@ -242,11 +252,13 @@ class MarketDataFetcher:
 
         if not data:
             log.warning("Options chain: All endpoints failed. PCR remains at previous value.")
+            self.context.mark_source("options_chain", "fallback_previous")
             return
 
         try:
             records = data.get("filtered", {}).get("data", []) or data.get("data", [])
             if not records:
+                self.context.mark_source("options_chain", "empty_records")
                 return
 
             total_call_oi = 0
@@ -274,11 +286,13 @@ class MarketDataFetcher:
 
             if strike_data:
                 self.context.nifty_max_pain = self._calculate_max_pain(strike_data)
+            self.context.mark_source("options_chain", "ok")
 
             log.info(f"Options → PCR: {self.context.nifty_pcr} ({self.context.pcr_sentiment}) | Max Pain: ₹{self.context.nifty_max_pain}")
 
         except Exception as e:
             log.warning(f"Options chain parsing failed: {e}")
+            self.context.mark_source("options_chain", "failed")
 
     @staticmethod
     def _calculate_max_pain(strike_data: dict) -> float:
@@ -317,6 +331,7 @@ class MarketDataFetcher:
 
             if not data:
                 log.info("Earnings calendar: No data returned (no actions today, or NSE unavailable)")
+                self.context.mark_source("earnings", "empty_or_unavailable")
                 return
 
             records = data if isinstance(data, list) else data.get("data", [])
@@ -330,6 +345,7 @@ class MarketDataFetcher:
                         earnings_today.add(symbol)
 
             self.context.earnings_today = earnings_today
+            self.context.mark_source("earnings", "ok")
             if earnings_today:
                 log.info(f"Corporate actions today ({len(earnings_today)} stocks): {', '.join(sorted(earnings_today))}")
             else:
@@ -337,6 +353,7 @@ class MarketDataFetcher:
 
         except Exception as e:
             log.warning(f"Earnings calendar fetch failed: {e}")
+            self.context.mark_source("earnings", "failed")
 
     # ── NEWS HEADLINES ────────────────────────────────────────────────────────
 
@@ -353,6 +370,8 @@ class MarketDataFetcher:
                 if title:
                     headlines.append(title)
             self.context.recent_headlines = headlines
+            self.context.mark_source("news", "ok")
             log.debug(f"News: {len(headlines)} headlines fetched.")
         except Exception as e:
             log.warning(f"News fetch failed: {e}")
+            self.context.mark_source("news", "failed")

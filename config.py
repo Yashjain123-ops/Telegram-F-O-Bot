@@ -74,14 +74,16 @@ log.info(f"Loaded static watchlist with {len(UNIVERSE)} F&O stocks.")
 # ==============================================================================
 # ⏰ TIME & SCHEDULE PARAMETERS
 # ==============================================================================
-TIMEZONE     = pytz.timezone("Asia/Kolkata")
-MARKET_OPEN  = time(9, 15)
-ORB_END      = time(9, 30)   # 15-minute Opening Range — no signals before this
-MARKET_CLOSE = time(15, 30)
+TIMEZONE      = pytz.timezone("Asia/Kolkata")
+WARMUP_START  = time(9, 15)
+SCANNER_START = time(9, 20)
+MARKET_OPEN   = WARMUP_START  # Backward-compatible alias for live data start.
+ORB_END       = SCANNER_START
+MARKET_CLOSE  = time(15, 30)
 
-# Number of 1-minute candles required before the engine evaluates a stock.
-# 15 candles = 15 minutes of data (aligns with ORB window).
-MIN_CANDLES_REQUIRED = 15
+# Number of 1-minute warm-up candles required before evaluation.
+# 5 candles aligns with the 9:15-9:20 mission warm-up window.
+MIN_CANDLES_REQUIRED = 5
 
 # Time to run morning data fetch (before market opens)
 MORNING_FETCH_TIME = "09:00"
@@ -286,3 +288,13 @@ SECTOR_GROUPS = {
         "DLF", "GODREJPROP", "LODHA", "OBEROIRLTY", "PHOENIXLTD", "PRESTIGE"
     ]
 }
+
+FLAT_SECTOR_MAP: dict[str, str] = {
+    symbol: sector_name
+    for sector_name, symbols in SECTOR_GROUPS.items()
+    for symbol in symbols
+}
+
+
+def get_sector_for_symbol(symbol: str, default: str = "NIFTY_50") -> str:
+    return FLAT_SECTOR_MAP.get(symbol, default)

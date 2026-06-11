@@ -1,6 +1,9 @@
 import asyncio
+import contextlib
 import logging
+
 import requests
+
 import config
 
 log = logging.getLogger("Notifier")
@@ -8,9 +11,9 @@ log = logging.getLogger("Notifier")
 
 class TelegramNotifier:
     def __init__(self):
-        self.queue         = asyncio.Queue()
-        self._worker_task  = None
-        self.text_url  = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+        self.queue = asyncio.Queue()
+        self._worker_task = None
+        self.text_url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
         self.photo_url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendPhoto"
 
     async def start(self):
@@ -21,45 +24,61 @@ class TelegramNotifier:
         await self.queue.join()
         if self._worker_task:
             self._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
 
     async def send(self, message: str):
-        """Queue a text message."""
         await self.queue.put({"type": "text", "content": message})
 
     async def send_photo(self, caption: str, image_bytes: bytes):
-        """Queue a photo message with caption."""
         await self.queue.put({"type": "photo", "caption": caption, "image": image_bytes})
 
     async def _worker(self):
         while True:
+            item = await self.queue.get()
             try:
-                item = await self.queue.get()
-
                 if item["type"] == "text":
                     payload = {
-                        "chat_id":    config.TELEGRAM_CHAT_ID,
-                        "text":       item["content"],
-                        "parse_mode": "Markdown"
+                        "chat_id": config.TELEGRAM_CHAT_ID,
+                        "text": item["content"],
+                        "parse_mode": "Markdown",
                     }
-                    await asyncio.to_thread(requests.post, self.text_url, json=payload)
+                    await self._post_with_retry(self.text_url, json=payload)
 
                 elif item["type"] == "photo":
                     payload = {
-                        "chat_id":    config.TELEGRAM_CHAT_ID,
-                        "caption":    item["caption"],
-                        "parse_mode": "Markdown"
+                        "chat_id": config.TELEGRAM_CHAT_ID,
+                        "caption": item["caption"],
+                        "parse_mode": "Markdown",
                     }
                     files = {"photo": ("chart.png", item["image"], "image/png")}
-                    await asyncio.to_thread(
-                        requests.post, self.photo_url, data=payload, files=files
-                    )
+                    await self._post_with_retry(self.photo_url, data=payload, files=files)
 
                 await asyncio.sleep(0.5)
+
+            except Exception as exc:
+                log.error(f"Failed to send Telegram message: {exc}")
+                await asyncio.sleep(2)
+            finally:
                 self.queue.task_done()
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.error(f"Failed to send Telegram message: {e}")
-                self.queue.task_done()
-                await asyncio.sleep(2)
+    async def _post_with_retry(self, url: str, **kwargs):
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                response = await asyncio.to_thread(
+                    requests.post,
+                    url,
+                    timeout=15,
+                    **kwargs,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not payload.get("ok", False):
+                    raise RuntimeError(payload)
+                return payload
+            except Exception as exc:
+                last_error = exc
+                log.warning(f"Telegram send failed (attempt {attempt}/3): {exc}")
+                await asyncio.sleep(attempt)
+        raise RuntimeError(f"Telegram send failed after retries: {last_error}")
